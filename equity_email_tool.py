@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -11,21 +11,25 @@ from typing import Callable
 
 import config
 
-
 try:
     import pdfplumber
-except ImportError:  # pragma: no cover - runtime dependency
+except ImportError:
     pdfplumber = None
 
 try:
     import fitz  # PyMuPDF
-except ImportError:  # pragma: no cover - runtime dependency
+except ImportError:
     fitz = None
 
 try:
     from pypdf import PdfReader
-except ImportError:  # pragma: no cover - runtime dependency
+except ImportError:
     PdfReader = None
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 
 from openai import OpenAI
 
@@ -60,9 +64,47 @@ TOKEN_STOPWORDS = {
 @dataclass
 class UserInputs:
     stock_name: str
+    isin: str
     action: str
+    reason: str  # "move" or "earnings"
     language: str
+    ticker: str | None = None
     replacement_stock: str | None = None
+    replacement_isin: str | None = None
+    replacement_ticker: str | None = None
+
+
+@dataclass
+class MarketData:
+    ticker: str
+    company_name: str
+    last_price: float
+    previous_close: float
+    change_pct: float
+    currency: str
+    last_close_date: str = ""
+    previous_close_date: str = ""
+    news_headlines: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EarningsData:
+    ticker: str
+    company_name: str
+    currency: str
+    reported_eps: float | None = None
+    estimated_eps: float | None = None
+    eps_surprise_pct: float | None = None
+    revenue: float | None = None
+    last_price: float = 0.0
+    previous_close: float = 0.0
+    change_pct: float = 0.0
+    last_close_date: str = ""
+    previous_close_date: str = ""
+    news_headlines: list[str] = field(default_factory=list)
+
+
+# ── Text utilities ──────────────────────────────────────────────────
 
 
 def normalize_text(text: str) -> str:
@@ -77,6 +119,9 @@ def normalize_text(text: str) -> str:
 def significant_tokens(text: str) -> list[str]:
     tokens = normalize_text(text).split()
     return [tok for tok in tokens if tok not in TOKEN_STOPWORDS and not tok.isdigit()]
+
+
+# ── Factsheet matching ──────────────────────────────────────────────
 
 
 def file_match_score(stock_query: str, pdf_path: Path) -> float:
@@ -136,6 +181,9 @@ def find_best_factsheet(stock_query: str, factsheet_dir: Path) -> Path:
     return best_pdf
 
 
+# ── PDF extraction ──────────────────────────────────────────────────
+
+
 def extract_with_pypdf(pdf_path: Path) -> str:
     if PdfReader is None:
         return ""
@@ -189,7 +237,7 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str]:
             cleaned = cleanup_extracted_text(raw_text)
             if cleaned:
                 candidates.append((len(cleaned), name, cleaned))
-        except Exception as exc:  # pragma: no cover - defensive branch
+        except Exception as exc:
             errors.append(f"{name}: {exc}")
 
     if not candidates:
@@ -204,6 +252,9 @@ def extract_pdf_text(pdf_path: Path) -> tuple[str, str]:
     return best_text, best_name
 
 
+# ── Action parsing ──────────────────────────────────────────────────
+
+
 def parse_action(raw_action: str) -> str:
     action = normalize_text(raw_action)
     if action in {"hold", "h"}:
@@ -215,50 +266,294 @@ def parse_action(raw_action: str) -> str:
     raise ValueError("Action must be Hold or Sell & Buy.")
 
 
-def build_hold_prompt(stock_name: str, language: str, factsheet_text: str) -> str:
+# ── Market data via yfinance ────────────────────────────────────────
+
+
+def _extract_headlines(stock: object) -> list[str]:
+    """Pull up to 5 news headlines from a yfinance Ticker, tolerating API changes."""
+    headlines: list[str] = []
+    try:
+        raw_news = stock.news or []  # type: ignore[union-attr]
+        for article in raw_news[:5]:
+            if isinstance(article, dict):
+                title = article.get("title", "") or (
+                    (article.get("content") or {}).get("title", "")
+                )
+                if title:
+                    headlines.append(title)
+    except Exception:
+        pass
+    return headlines
+
+
+def fetch_market_data(ticker: str) -> MarketData | None:
+    """Fetch previous-day price move and news headlines for *ticker*."""
+    if yf is None:
+        print("[INFO] yfinance not installed; skipping live market data.")
+        return None
+    try:
+        print(f"[INFO] Market data source: yfinance")
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+
+        hist = stock.history(period="5d")
+        last_date = prev_date = ""
+        if len(hist) >= 2:
+            prev_close = float(hist["Close"].iloc[-2])
+            last_close = float(hist["Close"].iloc[-1])
+            last_date = str(hist.index[-1].date())
+            prev_date = str(hist.index[-2].date())
+        else:
+            prev_close = float(info.get("previousClose", 0))
+            last_close = float(
+                info.get("currentPrice", info.get("regularMarketPrice", 0))
+            )
+
+        change_pct = (
+            ((last_close - prev_close) / prev_close * 100) if prev_close else 0.0
+        )
+
+        print(f"[INFO] Last close date: {last_date or 'N/A'}")
+        print(f"[INFO] Previous close date: {prev_date or 'N/A'}")
+
+        headlines = _extract_headlines(stock)
+        if headlines:
+            print("[INFO] Headlines used:")
+            for h in headlines:
+                print(f"  - {h}")
+        else:
+            print("[INFO] No recent news headlines found.")
+
+        return MarketData(
+            ticker=ticker,
+            company_name=info.get("shortName", ticker),
+            last_price=round(last_close, 2),
+            previous_close=round(prev_close, 2),
+            change_pct=round(change_pct, 2),
+            currency=info.get("currency", "USD"),
+            last_close_date=last_date,
+            previous_close_date=prev_date,
+            news_headlines=headlines,
+        )
+    except Exception as exc:
+        print(f"[INFO] Could not fetch market data for {ticker}: {exc}")
+        return None
+
+
+def fetch_earnings_data(ticker: str) -> EarningsData | None:
+    """Fetch latest earnings results, price reaction, and news for *ticker*."""
+    if yf is None:
+        print("[INFO] yfinance not installed; skipping earnings data.")
+        return None
+    try:
+        print(f"[INFO] Earnings data source: yfinance")
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+
+        # Price data (same as move path — needed for market reaction)
+        hist = stock.history(period="5d")
+        last_date = prev_date = ""
+        if len(hist) >= 2:
+            prev_close = float(hist["Close"].iloc[-2])
+            last_close = float(hist["Close"].iloc[-1])
+            last_date = str(hist.index[-1].date())
+            prev_date = str(hist.index[-2].date())
+        else:
+            prev_close = float(info.get("previousClose", 0))
+            last_close = float(
+                info.get("currentPrice", info.get("regularMarketPrice", 0))
+            )
+
+        change_pct = (
+            ((last_close - prev_close) / prev_close * 100) if prev_close else 0.0
+        )
+
+        print(f"[INFO] Last close date: {last_date or 'N/A'}")
+        print(f"[INFO] Previous close date: {prev_date or 'N/A'}")
+
+        # Earnings metrics
+        reported_eps: float | None = None
+        estimated_eps: float | None = None
+        eps_surprise_pct: float | None = None
+        revenue: float | None = None
+
+        try:
+            earnings_hist = stock.earnings_history
+            if earnings_hist is not None and len(earnings_hist) > 0:
+                latest = earnings_hist.iloc[-1]
+                reported_eps = float(latest.get("epsActual", 0)) if latest.get("epsActual") is not None else None
+                estimated_eps = float(latest.get("epsEstimate", 0)) if latest.get("epsEstimate") is not None else None
+                surprise = latest.get("epsDifference") or latest.get("surprisePercent")
+                eps_surprise_pct = float(surprise) if surprise is not None else None
+        except Exception:
+            pass
+
+        try:
+            rev = info.get("totalRevenue") or info.get("revenue")
+            revenue = float(rev) if rev is not None else None
+        except Exception:
+            pass
+
+        print(f"[INFO] Reported EPS: {reported_eps}")
+        print(f"[INFO] Estimated EPS: {estimated_eps}")
+        print(f"[INFO] EPS surprise: {eps_surprise_pct}")
+        print(f"[INFO] Revenue: {revenue}")
+
+        headlines = _extract_headlines(stock)
+        if headlines:
+            print("[INFO] Headlines used:")
+            for h in headlines:
+                print(f"  - {h}")
+        else:
+            print("[INFO] No recent news headlines found.")
+
+        return EarningsData(
+            ticker=ticker,
+            company_name=info.get("shortName", ticker),
+            currency=info.get("currency", "USD"),
+            reported_eps=reported_eps,
+            estimated_eps=estimated_eps,
+            eps_surprise_pct=eps_surprise_pct,
+            revenue=revenue,
+            last_price=round(last_close, 2),
+            previous_close=round(prev_close, 2),
+            change_pct=round(change_pct, 2),
+            last_close_date=last_date,
+            previous_close_date=prev_date,
+            news_headlines=headlines,
+        )
+    except Exception as exc:
+        print(f"[INFO] Could not fetch earnings data for {ticker}: {exc}")
+        return None
+
+
+def parse_reason(raw_reason: str) -> str:
+    reason = normalize_text(raw_reason)
+    if reason in {"move", "m", "price move", "market move"}:
+        return "move"
+    if reason in {"earnings", "e", "earning", "results", "quarterly"}:
+        return "earnings"
+    raise ValueError("Reason must be Move or Earnings.")
+
+
+# ── Prompt builders ─────────────────────────────────────────────────
+
+
+def build_move_prompt(stock_name: str, language: str, market: MarketData) -> str:
+    direction = "increased" if market.change_pct >= 0 else "decreased"
+    headlines_block = (
+        "\n".join(f"- {h}" for h in market.news_headlines)
+        or "- No recent headlines available."
+    )
     return f"""
-You are writing a financial client email summary in {language}.
+You are writing one sentence for a professional client email in {language}.
+
+Market data for {stock_name} ({market.ticker}):
+- Change: {market.change_pct:+.1f}%
+- Direction: {direction}
+
+Recent news headlines:
+{headlines_block}
 
 Task:
-Use ONLY the factsheet text below.
-Explain why the recommendation is to HOLD {stock_name} after recent price changes.
-Write in professional, client-ready language without hype.
+Write exactly ONE sentence that states the percentage change and gives the most
+likely reason based on the headlines above. If the headlines do not clearly explain
+the move, attribute it to general market or sector dynamics.
 
-Output requirements:
-- Return ONLY valid JSON, no markdown, no extra text.
-- Use exactly this JSON schema:
-{{
-  "thesis": "one concise sentence",
-  "support_points": ["sentence 1", "sentence 2", "sentence 3"],
-  "watchpoint": "one concise sentence"
-}}
-- Do not invent facts.
-- If the factsheet does not support a detail, write a cautious generic statement grounded in available text.
+Rules:
+- State only the percentage move, do NOT include absolute price figures.
+- Write in {language}, professional advisory tone, no hype.
+- The sentence must work as a standalone paragraph in the email.
 
-Factsheet text:
-\"\"\"{factsheet_text}\"\"\"
+Return ONLY valid JSON:
+{{"move_explanation": "one sentence"}}
+""".strip()
+
+
+def build_earnings_prompt(
+    stock_name: str, language: str, earnings: EarningsData
+) -> str:
+    direction = "increased" if earnings.change_pct >= 0 else "decreased"
+    headlines_block = (
+        "\n".join(f"- {h}" for h in earnings.news_headlines)
+        or "- No recent headlines available."
+    )
+
+    eps_block = ""
+    if earnings.reported_eps is not None:
+        eps_block += f"- Reported EPS: {earnings.reported_eps}\n"
+    if earnings.estimated_eps is not None:
+        eps_block += f"- Estimated EPS: {earnings.estimated_eps}\n"
+    if earnings.eps_surprise_pct is not None:
+        eps_block += f"- EPS surprise: {earnings.eps_surprise_pct:+.1f}%\n"
+    if earnings.revenue is not None:
+        eps_block += f"- Revenue: {earnings.currency} {earnings.revenue:,.0f}\n"
+    if not eps_block:
+        eps_block = "- No detailed earnings metrics available.\n"
+
+    return f"""
+You are writing one sentence for a professional client email in {language}.
+
+Latest earnings data for {stock_name} ({earnings.ticker}):
+{eps_block.rstrip()}
+
+Market reaction:
+- Change: {earnings.change_pct:+.1f}%
+- Direction: {direction}
+
+Recent news headlines:
+{headlines_block}
+
+Task:
+Write exactly ONE sentence that summarises the latest earnings results (EPS, revenue,
+beat/miss) and the market reaction. If specific earnings numbers are not available,
+focus on the news headlines and price reaction.
+
+Rules:
+- State only the percentage move, do NOT include absolute stock price figures.
+- You may cite EPS and revenue numbers from the earnings data above.
+- Write in {language}, professional advisory tone, no hype.
+- The sentence must work as a standalone paragraph in the email.
+
+Return ONLY valid JSON:
+{{"move_explanation": "one sentence"}}
 """.strip()
 
 
 def build_sell_prompt(stock_name: str, language: str, factsheet_text: str) -> str:
     return f"""
-You are writing a financial client email summary in {language}.
+You are writing a financial analysis for a professional client email in {language}.
 
 Task:
-Use ONLY the factsheet text below.
-Explain why the recommendation is to SELL {stock_name} after recent price changes.
+Analyze the factsheet below for {stock_name}.
+Extract the key data points that explain why this stock warrants a SELL or weak
+recommendation. Focus on: Morningstar / analyst rating, star rating, fair value
+estimate vs current price, valuation concerns, risk factors, and investment weaknesses.
 Write in professional, client-ready language without hype.
+
+Important PDF encoding note:
+In Morningstar factsheets the star rating is often encoded as repeated letter Q.
+QQQQQ = 5 stars, QQQQ = 4 stars, QQQ = 3 stars, QQ = 2 stars, Q = 1 star.
+Always convert these to the numeric star count (e.g. write "2-star" not "QQ").
+Never output the raw Q symbols in your response.
 
 Output requirements:
 - Return ONLY valid JSON, no markdown, no extra text.
-- Use exactly this JSON schema:
+- Use exactly this schema:
 {{
-  "thesis": "one concise sentence",
-  "support_points": ["sentence 1", "sentence 2", "sentence 3"],
-  "execution_note": "one concise sentence"
+  "analyst_rating": "the recommendation rating stated in the factsheet (e.g. Sell, Reduce, Hold, Accumulate, Buy) or 'Not specified' if absent",
+  "morningstar_stars": <integer 1-5 if found in factsheet, otherwise null>,
+  "sell_paragraph": "2-4 professional sentences explaining why this stock should be sold. Reference the factsheet rating, star rating, and valuation framework. Every claim must be grounded in the factsheet text.",
+  "key_concerns": ["concern 1", "concern 2", "concern 3"]
 }}
-- Do not invent facts.
-- If the factsheet does not support a detail, write a cautious generic statement grounded in available text.
+- Extract ratings and metrics directly from the factsheet. Do not invent facts.
+- If the factsheet does not contain a specific metric, acknowledge what data is available instead.
+- IMPORTANT: When referencing prices or fair values from the factsheet, always qualify
+  them as "the factsheet's figures" or "based on the factsheet's valuation framework".
+  Do NOT present factsheet prices as live/current market prices — they may be outdated.
+  For example write "Based on the factsheet's valuation framework, the stock appears
+  overvalued" rather than "The current price of $X is above...".
+- Ensure every sentence has proper spacing between all words.
 
 Factsheet text:
 \"\"\"{factsheet_text}\"\"\"
@@ -267,27 +562,85 @@ Factsheet text:
 
 def build_buy_prompt(stock_name: str, language: str, factsheet_text: str) -> str:
     return f"""
-You are writing a financial client email summary in {language}.
+You are writing a financial analysis for a professional client email in {language}.
 
 Task:
-Use ONLY the factsheet text below.
-Explain why the recommendation is to BUY {stock_name} as a replacement position.
+Analyze the factsheet below for {stock_name}.
+Extract the key data points that explain why this stock is a BUY or strong
+recommendation as a replacement position. Focus on: Morningstar / analyst rating,
+star rating, fair value estimate vs current price, valuation upside, investment
+strengths, quality metrics, and growth potential.
 Write in professional, client-ready language without hype.
+
+Important PDF encoding note:
+In Morningstar factsheets the star rating is often encoded as repeated letter Q.
+QQQQQ = 5 stars, QQQQ = 4 stars, QQQ = 3 stars, QQ = 2 stars, Q = 1 star.
+Always convert these to the numeric star count (e.g. write "4-star" not "QQQQ").
+Never output the raw Q symbols in your response.
 
 Output requirements:
 - Return ONLY valid JSON, no markdown, no extra text.
-- Use exactly this JSON schema:
+- Use exactly this schema:
 {{
-  "thesis": "one concise sentence",
-  "support_points": ["sentence 1", "sentence 2", "sentence 3"],
-  "portfolio_fit": "one concise sentence"
+  "analyst_rating": "the recommendation rating stated in the factsheet (e.g. Buy, Accumulate, Hold) or 'Not specified' if absent",
+  "morningstar_stars": <integer 1-5 if found in factsheet, otherwise null>,
+  "buy_paragraph": "2-4 professional sentences explaining why this stock should be bought. Reference the factsheet rating, star rating, and valuation framework. Every claim must be grounded in the factsheet text.",
+  "portfolio_fit": "1-2 sentences explaining how this stock improves portfolio positioning and diversification",
+  "key_strengths": ["strength 1", "strength 2", "strength 3"]
 }}
-- Do not invent facts.
-- If the factsheet does not support a detail, write a cautious generic statement grounded in available text.
+- Extract ratings and metrics directly from the factsheet. Do not invent facts.
+- If the factsheet does not contain a specific metric, acknowledge what data is available instead.
+- IMPORTANT: When referencing prices or fair values from the factsheet, always qualify
+  them as "the factsheet's figures" or "based on the factsheet's valuation framework".
+  Do NOT present factsheet prices as live/current market prices — they may be outdated.
+  For example write "Based on the factsheet's valuation, the stock trades below fair
+  value" rather than "The current price of $X is below...".
+- Ensure every sentence has proper spacing between all words.
 
 Factsheet text:
 \"\"\"{factsheet_text}\"\"\"
 """.strip()
+
+
+def build_hold_prompt(stock_name: str, language: str, factsheet_text: str) -> str:
+    return f"""
+You are writing a financial analysis for a professional client email in {language}.
+
+Task:
+Analyze the factsheet below for {stock_name}.
+Extract the key data points that support a HOLD recommendation despite recent price
+changes. Focus on: Morningstar / analyst rating, star rating, fair value estimate vs
+current price, balanced investment case, and factors to monitor.
+Write in professional, client-ready language without hype.
+
+Important PDF encoding note:
+In Morningstar factsheets the star rating is often encoded as repeated letter Q.
+QQQQQ = 5 stars, QQQQ = 4 stars, QQQ = 3 stars, QQ = 2 stars, Q = 1 star.
+Always convert these to the numeric star count (e.g. write "3-star" not "QQQ").
+Never output the raw Q symbols in your response.
+
+Output requirements:
+- Return ONLY valid JSON, no markdown, no extra text.
+- Use exactly this schema:
+{{
+  "analyst_rating": "the recommendation rating stated in the factsheet or 'Not specified' if absent",
+  "morningstar_stars": <integer 1-5 if found in factsheet, otherwise null>,
+  "hold_paragraph": "2-4 professional sentences explaining why this stock should be held. Reference the factsheet rating, star rating, and valuation framework. Every claim must be grounded in the factsheet text.",
+  "watchpoint": "1-2 sentences about what to monitor going forward"
+}}
+- Extract ratings and metrics directly from the factsheet. Do not invent facts.
+- If the factsheet does not contain a specific metric, acknowledge what data is available instead.
+- IMPORTANT: When referencing prices or fair values from the factsheet, always qualify
+  them as "the factsheet's figures" or "based on the factsheet's valuation framework".
+  Do NOT present factsheet prices as live/current market prices — they may be outdated.
+- Ensure every sentence has proper spacing between all words.
+
+Factsheet text:
+\"\"\"{factsheet_text}\"\"\"
+""".strip()
+
+
+# ── JSON helpers ────────────────────────────────────────────────────
 
 
 def _extract_json_from_model_text(text: str) -> dict:
@@ -307,47 +660,109 @@ def _extract_json_from_model_text(text: str) -> dict:
         return json.loads(candidate[start : end + 1])
 
 
-def _clean_sentence(text: str) -> str:
-    cleaned = re.sub(r"\s+", " ", (text or "").strip())
-    return cleaned
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
-def _validate_summary_payload(payload: dict, required_tail_key: str) -> dict:
-    thesis = _clean_sentence(str(payload.get("thesis", "")))
-    support_points = payload.get("support_points", [])
-    tail_value = _clean_sentence(str(payload.get(required_tail_key, "")))
+# ── Payload validators ──────────────────────────────────────────────
 
-    if not isinstance(support_points, list):
-        raise ValueError("support_points must be a list.")
 
-    points = [_clean_sentence(str(item)) for item in support_points if _clean_sentence(str(item))]
-    if len(points) < 3:
-        raise ValueError("Expected at least 3 support_points.")
+def _validate_move_payload(payload: dict) -> dict:
+    explanation = _clean(str(payload.get("move_explanation", "")))
+    if not explanation:
+        raise ValueError("Missing move_explanation in model response.")
+    return {"move_explanation": explanation}
 
-    if not thesis:
-        raise ValueError("Missing thesis in model response.")
-    if not tail_value:
-        raise ValueError(f"Missing {required_tail_key} in model response.")
 
+def _validate_sell_payload(payload: dict) -> dict:
+    paragraph = _clean(str(payload.get("sell_paragraph", "")))
+    if not paragraph:
+        raise ValueError("Missing sell_paragraph in model response.")
+    concerns = [
+        _clean(str(c))
+        for c in (payload.get("key_concerns") or [])
+        if _clean(str(c))
+    ]
+    if len(concerns) < 2:
+        raise ValueError("Expected at least 2 key_concerns.")
     return {
-        "thesis": thesis,
-        "support_points": points[:3],
-        required_tail_key: tail_value,
+        "analyst_rating": _clean(str(payload.get("analyst_rating", "Not specified"))),
+        "morningstar_stars": payload.get("morningstar_stars"),
+        "sell_paragraph": paragraph,
+        "key_concerns": concerns[:4],
     }
 
 
-def call_openai_summary(client: OpenAI, prompt: str, required_tail_key: str) -> dict:
+def _validate_buy_payload(payload: dict) -> dict:
+    paragraph = _clean(str(payload.get("buy_paragraph", "")))
+    if not paragraph:
+        raise ValueError("Missing buy_paragraph in model response.")
+    fit = _clean(str(payload.get("portfolio_fit", "")))
+    if not fit:
+        raise ValueError("Missing portfolio_fit in model response.")
+    strengths = [
+        _clean(str(s))
+        for s in (payload.get("key_strengths") or [])
+        if _clean(str(s))
+    ]
+    if len(strengths) < 2:
+        raise ValueError("Expected at least 2 key_strengths.")
+    return {
+        "analyst_rating": _clean(str(payload.get("analyst_rating", "Not specified"))),
+        "morningstar_stars": payload.get("morningstar_stars"),
+        "buy_paragraph": paragraph,
+        "portfolio_fit": fit,
+        "key_strengths": strengths[:4],
+    }
+
+
+def _validate_hold_payload(payload: dict) -> dict:
+    paragraph = _clean(str(payload.get("hold_paragraph", "")))
+    if not paragraph:
+        raise ValueError("Missing hold_paragraph in model response.")
+    watchpoint = _clean(str(payload.get("watchpoint", "")))
+    if not watchpoint:
+        raise ValueError("Missing watchpoint in model response.")
+    return {
+        "analyst_rating": _clean(str(payload.get("analyst_rating", "Not specified"))),
+        "morningstar_stars": payload.get("morningstar_stars"),
+        "hold_paragraph": paragraph,
+        "watchpoint": watchpoint,
+    }
+
+
+# ── OpenAI caller ───────────────────────────────────────────────────
+
+
+ANALYST_SYSTEM = (
+    "You are a careful equity analyst writer. "
+    "Extract data only from the provided factsheet text. "
+    "Never invent facts or metrics. Follow the output schema exactly."
+)
+
+MOVE_SYSTEM = (
+    "You are a financial market commentator. "
+    "Write one factual sentence about a stock price move. "
+    "Follow the output schema exactly."
+)
+
+EARNINGS_SYSTEM = (
+    "You are a financial market commentator. "
+    "Write one factual sentence summarising the latest earnings results "
+    "and market reaction. Follow the output schema exactly."
+)
+
+
+def call_openai(
+    client: OpenAI,
+    prompt: str,
+    system_message: str,
+    validator: Callable[[dict], dict],
+) -> dict:
     response = client.responses.create(
         model=config.OPENAI_MODEL,
         input=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a careful equity analyst writer. "
-                    "Use only provided factsheet text, avoid unsupported claims, "
-                    "and follow output format exactly."
-                ),
-            },
+            {"role": "system", "content": system_message},
             {"role": "user", "content": prompt},
         ],
     )
@@ -356,84 +771,142 @@ def call_openai_summary(client: OpenAI, prompt: str, required_tail_key: str) -> 
     if not text:
         raise RuntimeError("OpenAI response was empty.")
     payload = _extract_json_from_model_text(text)
-    return _validate_summary_payload(payload, required_tail_key)
+    return validator(payload)
 
 
-def render_hold_summary(stock_name: str, payload: dict) -> str:
-    points = payload["support_points"]
-    return (
-        f"Recommendation: Hold {stock_name}\n\n"
-        "Investment rationale:\n"
-        f"1. {payload['thesis']}\n"
-        f"2. {points[0]}\n"
-        f"3. {points[1]}\n"
-        f"4. {points[2]}\n\n"
-        f"Key watchpoint: {payload['watchpoint']}"
+# ── Email builders ──────────────────────────────────────────────────
+
+
+def _stars_label(stars: int | None) -> str:
+    if stars is None:
+        return ""
+    return f" and a {stars}-star Morningstar rating"
+
+
+def cleanup_email_text(text: str) -> str:
+    """Fix common LLM spacing issues before saving the email."""
+    # Insert space between a lowercase letter immediately followed by an uppercase letter
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+    # Insert space after a comma/period/semicolon not followed by a space or newline
+    text = re.sub(r"([,;])(?=[^\s])", r"\1 ", text)
+    text = re.sub(r"(\.)(?=[A-Z])", r". ", text)
+    # Collapse multiple spaces (but not newlines)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
+
+def build_sell_buy_email(
+    stock_name: str,
+    isin: str,
+    replacement_name: str,
+    replacement_isin: str,
+    sell_data: dict,
+    buy_data: dict,
+    move_explanation: str | None,
+) -> str:
+    intro = (
+        f"Your holding {stock_name} ({isin}) in account ACCOUNT_NAME "
+        f"is currently recommended for sale."
     )
 
+    if move_explanation:
+        move_paragraph = move_explanation
+        if not move_paragraph.rstrip().endswith("."):
+            move_paragraph = move_paragraph.rstrip() + "."
+    else:
+        move_paragraph = ""
 
-def render_sell_summary(stock_name: str, payload: dict) -> str:
-    points = payload["support_points"]
-    return (
-        f"Sell rationale ({stock_name}):\n"
-        f"1. {payload['thesis']}\n"
-        f"2. {points[0]}\n"
-        f"3. {points[1]}\n"
-        f"4. {points[2]}\n\n"
-        f"Execution note: {payload['execution_note']}"
+    sell_rating = sell_data["analyst_rating"]
+    sell_stars = _stars_label(sell_data.get("morningstar_stars"))
+    sell_section = (
+        f"Despite the recent move, we recommend selling {stock_name}. "
+        f"The {stock_name} factsheet shows a {sell_rating} rating{sell_stars}, "
+        f"which indicates limited attractiveness at the current level. "
+        f"{sell_data['sell_paragraph']}"
     )
 
-
-def render_buy_summary(stock_name: str, payload: dict) -> str:
-    points = payload["support_points"]
-    return (
-        f"Buy rationale ({stock_name}):\n"
-        f"1. {payload['thesis']}\n"
-        f"2. {points[0]}\n"
-        f"3. {points[1]}\n"
-        f"4. {points[2]}\n\n"
-        f"Portfolio fit: {payload['portfolio_fit']}"
+    buy_rating = buy_data["analyst_rating"]
+    buy_stars = _stars_label(buy_data.get("morningstar_stars"))
+    buy_section = (
+        f"We recommend switching into {replacement_name} ({replacement_isin}). "
+        f"The {replacement_name} factsheet shows a {buy_rating} rating{buy_stars}. "
+        f"{buy_data['buy_paragraph']}"
     )
+
+    parts = [f"Dear CLIENT_NAME,", "", intro]
+    if move_paragraph:
+        parts += ["", move_paragraph]
+    parts += [
+        "",
+        sell_section,
+        "",
+        buy_section,
+        "",
+        buy_data["portfolio_fit"],
+        "",
+        f"Bottom line: We recommend selling {stock_name} and switching into "
+        f"{replacement_name}.",
+        "",
+        "Do not hesitate to reach out to your CRO if you have any questions.",
+        "",
+        "Kind regards,",
+        "CRO_NAME",
+    ]
+
+    return cleanup_email_text("\n".join(parts) + "\n")
+
+
+def build_hold_email(
+    stock_name: str,
+    isin: str,
+    hold_data: dict,
+    move_explanation: str | None,
+) -> str:
+    intro = (
+        f"Your holding {stock_name} ({isin}) in account ACCOUNT_NAME "
+        f"is currently recommended as HOLD."
+    )
+
+    if move_explanation:
+        move_paragraph = move_explanation
+        if not move_paragraph.rstrip().endswith("."):
+            move_paragraph = move_paragraph.rstrip() + "."
+    else:
+        move_paragraph = ""
+
+    hold_rating = hold_data["analyst_rating"]
+    hold_stars = _stars_label(hold_data.get("morningstar_stars"))
+
+    hold_section = (
+        f"We continue to recommend holding {stock_name}. "
+        f"The factsheet shows a {hold_rating} rating{hold_stars}. "
+        f"{hold_data['hold_paragraph']}"
+    )
+
+    parts = [f"Dear CLIENT_NAME,", "", intro]
+    if move_paragraph:
+        parts += ["", move_paragraph]
+    parts += [
+        "",
+        hold_section,
+        "",
+        f"Key watchpoint: {hold_data['watchpoint']}",
+        "",
+        "Do not hesitate to reach out to your CRO if you have any questions.",
+        "",
+        "Kind regards,",
+        "CRO_NAME",
+    ]
+
+    return cleanup_email_text("\n".join(parts) + "\n")
+
+
+# ── File helpers ────────────────────────────────────────────────────
 
 
 def sanitize_for_filename(value: str) -> str:
     normalized = normalize_text(value).replace(" ", "_")
     return normalized[:40] if normalized else "unknown"
-
-
-def build_email_text(
-    action: str,
-    stock_name: str,
-    summary_primary: str,
-    replacement_stock: str | None = None,
-    summary_replacement: str | None = None,
-) -> str:
-    if action == "hold":
-        first_line = (
-            f"Your holding {stock_name} (ISIN_NUMBER) in account ACCOUNT_NAME "
-            "is currently recommended as HOLD."
-        )
-        summary_block = summary_primary
-    else:
-        first_line = (
-            f"Your holding {stock_name} (ISIN_NUMBER) in account ACCOUNT_NAME "
-            f"is currently recommended to SELL and replace with {replacement_stock}."
-        )
-        summary_block = (
-            f"Recommendation: Sell {stock_name} and buy {replacement_stock}\n\n"
-            f"{summary_primary}\n\n"
-            f"{summary_replacement or ''}"
-        ).strip()
-
-    return (
-        "Dear CLIENT_NAME\n\n"
-        f"{first_line}\n\n"
-        "Here will follow a summary breakdown of *why* we're recommending the action.\n\n"
-        f"{summary_block}\n\n"
-        "Do not hesitate to reach out to your CRO if you have any questions.\n\n"
-        "Kind regards,\n"
-        "CRO_NAME\n"
-    )
 
 
 def save_email(output_dir: Path, filename: str, body: str) -> Path:
@@ -443,28 +916,51 @@ def save_email(output_dir: Path, filename: str, body: str) -> Path:
     return path
 
 
+# ── CLI input ───────────────────────────────────────────────────────
+
+
 def collect_inputs() -> UserInputs:
-    stock_name = input("Enter stock name: ").strip()
-    raw_action = input("Enter recommendation type (Hold / Sell & Buy): ").strip()
+    stock_name = input("Enter company name: ").strip()
+    isin = input("Enter ISIN: ").strip()
+    ticker = input("Enter ticker for market data (e.g. ABBN.SW): ").strip() or None
+    raw_reason = input("Enter reason (Move / Earnings): ").strip()
     language = input("Enter email language (free text): ").strip()
+    raw_action = input("Enter recommendation (Hold / Sell & Buy): ").strip()
 
     if not stock_name:
-        raise ValueError("Stock name cannot be empty.")
+        raise ValueError("Company name cannot be empty.")
+    if not isin:
+        raise ValueError("ISIN cannot be empty.")
     if not language:
         raise ValueError("Language cannot be empty.")
 
+    reason = parse_reason(raw_reason)
     action = parse_action(raw_action)
+
     replacement_stock = None
+    replacement_isin = None
+    replacement_ticker = None
     if action == "sell_buy":
-        replacement_stock = input("Enter replacement stock name to buy: ").strip()
+        replacement_stock = input("Enter target company name: ").strip()
+        replacement_isin = input("Enter target ISIN: ").strip()
+        replacement_ticker = (
+            input("Enter target ticker for market data: ").strip() or None
+        )
         if not replacement_stock:
-            raise ValueError("Replacement stock name cannot be empty for Sell & Buy.")
+            raise ValueError("Target company name cannot be empty for Sell & Buy.")
+        if not replacement_isin:
+            raise ValueError("Target ISIN cannot be empty for Sell & Buy.")
 
     return UserInputs(
         stock_name=stock_name,
+        isin=isin,
         action=action,
+        reason=reason,
         language=language,
+        ticker=ticker,
         replacement_stock=replacement_stock,
+        replacement_isin=replacement_isin,
+        replacement_ticker=replacement_ticker,
     )
 
 
@@ -476,10 +972,15 @@ def validate_config() -> tuple[Path, Path]:
 
     factsheet_dir = Path(config.FACTSHEETS_DIR).expanduser()
     if not factsheet_dir.exists() or not factsheet_dir.is_dir():
-        raise FileNotFoundError(f"FACTSHEETS_DIR does not exist or is not a folder: {factsheet_dir}")
+        raise FileNotFoundError(
+            f"FACTSHEETS_DIR does not exist or is not a folder: {factsheet_dir}"
+        )
 
     output_dir = Path(config.OUTPUT_DIR).expanduser()
     return factsheet_dir, output_dir
+
+
+# ── Main ────────────────────────────────────────────────────────────
 
 
 def main() -> None:
@@ -488,54 +989,142 @@ def main() -> None:
 
     client = OpenAI(api_key=config.OPENAI_API_KEY)
 
+    print(f"\n[INFO] Company: {user_input.stock_name}")
+    print(f"[INFO] ISIN: {user_input.isin}")
+    print(f"[INFO] Reason: {user_input.reason}")
+    print(f"[INFO] Action: {user_input.action}")
+
+    # ── Fetch live data based on reason ──
+    move_explanation: str | None = None
+
+    if user_input.ticker:
+        print(f"[INFO] Fetching {'earnings' if user_input.reason == 'earnings' else 'market'} data for {user_input.ticker}...")
+
+        if user_input.reason == "earnings":
+            earnings = fetch_earnings_data(user_input.ticker)
+            if earnings:
+                direction = "up" if earnings.change_pct >= 0 else "down"
+                print(
+                    f"[INFO] {earnings.company_name}: {earnings.currency} "
+                    f"{earnings.last_price} ({earnings.change_pct:+.2f}% {direction})"
+                )
+                earnings_prompt = build_earnings_prompt(
+                    user_input.stock_name, user_input.language, earnings
+                )
+                move_data = call_openai(
+                    client, earnings_prompt, EARNINGS_SYSTEM, _validate_move_payload
+                )
+                move_explanation = move_data["move_explanation"]
+                print("[INFO] Earnings explanation generated.")
+            else:
+                print("[INFO] Earnings data unavailable; email will omit earnings context.")
+        else:
+            market = fetch_market_data(user_input.ticker)
+            if market:
+                direction = "up" if market.change_pct >= 0 else "down"
+                print(
+                    f"[INFO] {market.company_name}: {market.currency} "
+                    f"{market.last_price} ({market.change_pct:+.2f}% {direction})"
+                )
+                move_prompt = build_move_prompt(
+                    user_input.stock_name, user_input.language, market
+                )
+                move_data = call_openai(
+                    client, move_prompt, MOVE_SYSTEM, _validate_move_payload
+                )
+                move_explanation = move_data["move_explanation"]
+                print("[INFO] Move explanation generated.")
+            else:
+                print("[INFO] Market data unavailable; email will omit price-move context.")
+    else:
+        print("[INFO] No ticker provided; skipping live data retrieval.")
+
+    # ── Match and extract primary factsheet ──
     primary_pdf = find_best_factsheet(user_input.stock_name, factsheet_dir)
     primary_text, primary_engine = extract_pdf_text(primary_pdf)
-
     print(f"[INFO] Matched primary stock to: {primary_pdf.name}")
-    print(f"[INFO] Text extracted using: {primary_engine} ({len(primary_text)} characters)")
+    print(
+        f"[INFO] Text extracted using: {primary_engine} "
+        f"({len(primary_text)} characters)"
+    )
 
     if user_input.action == "hold":
-        hold_prompt = build_hold_prompt(user_input.stock_name, user_input.language, primary_text)
-        hold_payload = call_openai_summary(client, hold_prompt, required_tail_key="watchpoint")
-        primary_summary = render_hold_summary(user_input.stock_name, hold_payload)
-        replacement_summary = None
-        replacement_name = None
-    else:
-        sell_prompt = build_sell_prompt(user_input.stock_name, user_input.language, primary_text)
-        sell_payload = call_openai_summary(client, sell_prompt, required_tail_key="execution_note")
-        primary_summary = render_sell_summary(user_input.stock_name, sell_payload)
+        # ── Hold analysis from primary factsheet ──
+        hold_prompt = build_hold_prompt(
+            user_input.stock_name, user_input.language, primary_text
+        )
+        hold_data = call_openai(
+            client, hold_prompt, ANALYST_SYSTEM, _validate_hold_payload
+        )
+        print(
+            f"[INFO] Hold analysis complete "
+            f"(rating: {hold_data['analyst_rating']}, "
+            f"stars: {hold_data.get('morningstar_stars', 'N/A')})"
+        )
 
+        email_body = build_hold_email(
+            user_input.stock_name, user_input.isin, hold_data, move_explanation
+        )
+    else:
+        # ── Sell analysis from primary factsheet ──
+        sell_prompt = build_sell_prompt(
+            user_input.stock_name, user_input.language, primary_text
+        )
+        sell_data = call_openai(
+            client, sell_prompt, ANALYST_SYSTEM, _validate_sell_payload
+        )
+        print(
+            f"[INFO] Sell analysis complete "
+            f"(rating: {sell_data['analyst_rating']}, "
+            f"stars: {sell_data.get('morningstar_stars', 'N/A')})"
+        )
+
+        # ── Match and extract replacement factsheet ──
         replacement_name = user_input.replacement_stock or ""
+        replacement_isin = user_input.replacement_isin or ""
         replacement_pdf = find_best_factsheet(replacement_name, factsheet_dir)
         replacement_text, replacement_engine = extract_pdf_text(replacement_pdf)
-
         print(f"[INFO] Matched replacement stock to: {replacement_pdf.name}")
         print(
             f"[INFO] Text extracted using: {replacement_engine} "
             f"({len(replacement_text)} characters)"
         )
 
-        buy_prompt = build_buy_prompt(replacement_name, user_input.language, replacement_text)
-        buy_payload = call_openai_summary(client, buy_prompt, required_tail_key="portfolio_fit")
-        replacement_summary = render_buy_summary(replacement_name, buy_payload)
+        # ── Buy analysis from replacement factsheet ──
+        buy_prompt = build_buy_prompt(
+            replacement_name, user_input.language, replacement_text
+        )
+        buy_data = call_openai(
+            client, buy_prompt, ANALYST_SYSTEM, _validate_buy_payload
+        )
+        print(
+            f"[INFO] Buy analysis complete "
+            f"(rating: {buy_data['analyst_rating']}, "
+            f"stars: {buy_data.get('morningstar_stars', 'N/A')})"
+        )
 
-    email_body = build_email_text(
-        action=user_input.action,
-        stock_name=user_input.stock_name,
-        summary_primary=primary_summary,
-        replacement_stock=replacement_name,
-        summary_replacement=replacement_summary,
-    )
+        email_body = build_sell_buy_email(
+            user_input.stock_name,
+            user_input.isin,
+            replacement_name,
+            replacement_isin,
+            sell_data,
+            buy_data,
+            move_explanation,
+        )
 
+    # ── Save ──
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     action_tag = "hold" if user_input.action == "hold" else "sell_buy"
-    first_name_tag = sanitize_for_filename(user_input.stock_name)
+    first_tag = sanitize_for_filename(user_input.stock_name)
 
     if user_input.action == "hold":
-        filename = f"{timestamp}_{action_tag}_{first_name_tag}.txt"
+        filename = f"{timestamp}_{action_tag}_{first_tag}.txt"
     else:
-        second_name_tag = sanitize_for_filename(replacement_name or "replacement")
-        filename = f"{timestamp}_{action_tag}_{first_name_tag}_to_{second_name_tag}.txt"
+        second_tag = sanitize_for_filename(
+            user_input.replacement_stock or "replacement"
+        )
+        filename = f"{timestamp}_{action_tag}_{first_tag}_to_{second_tag}.txt"
 
     output_file = save_email(output_dir, filename, email_body)
 
